@@ -11,8 +11,8 @@
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const round = v => Math.round((v + Number.EPSILON) * 100) / 100;
   const cents = v => Math.round(v * 100);
-  const state = {screen:'loading', trip:null, stations:[], station:null, location:null, fuel:'diesel', pump:null, liters:'50', purpose:'Тягач', fueling:null, busy:false, error:'', stale:false, geoError:false, all:false, sort:'distance', search:'', confirmed:false};
-  let journal = {}, storageOK = true, timer = null, pollBusy = false, resolving = false, failures = 0;
+  const state = {screen:'loading', trip:null, stations:[], station:null, location:null, fuel:'diesel', pump:null, liters:'', purpose:'Тягач', fueling:null, busy:false, error:'', stale:false, geoError:false, all:false, sort:'price', search:'', confirmed:false};
+  let journal = {}, storageOK = true, timer = null, pollBusy = false, resolving = false, sessionOwned = false, failures = 0;
   function readJournal() {
     const raw = localStorage.getItem(KEY);
     if (!raw) return {};
@@ -66,10 +66,11 @@
     const s=state.station, f=state.fueling;
     const errors=notice(state.error,'error');
     if(state.screen==='loading') html=header('Заправка в рейсе')+'<p>Проверяем рейс и незавершённые заправки…</p>';
+    if(state.screen==='otherTab') html=header('Открыта другая вкладка')+'<p>Продолжите заправку в первой вкладке. Одновременная работа в нескольких вкладках недоступна.</p><p>Чтобы перейти сюда, закройте первую вкладку и перезагрузите эту страницу.</p>';
     if(state.screen==='bootError') html=header('Не удалось обновить данные')+'<p>Новый заказ недоступен, пока не проверим предыдущие операции.</p>'+errors+btn('Проверить ещё раз','boot');
     if(state.screen==='home') {
       const t=state.trip;
-      html=header('Заправка в рейсе')+`<div class="card"><div class="eyebrow">Текущий рейс · ${esc(new Date(t.date+'T12:00:00').toLocaleDateString('ru-RU',{day:'numeric',month:'long'}))}</div><div class="route">${esc(t.from)} → ${esc(t.to)}</div><p class="muted">Тягач ${esc(t.truck)}</p></div><div class="card"><div class="small">Сейчас доступно</div><div class="hero">${esc(num(t.limitLeft))} ₽</div><div class="small">Общий лимит рейса ${esc(money(t.limitTotal))}</div><div class="bar"><i style="width:${Math.min(100,Math.max(0,100*t.limitLeft/t.limitTotal))}%"></i></div><details><summary>Почему доступно меньше?</summary><p>Лимит уменьшают покупки и временные резервы. Резерв — деньги под заказ: их нельзя потратить повторно. После расчёта АЗС неиспользованная часть возвращается.</p><p>API не показывает историю и старые резервы отдельно. Разницу ${esc(money(t.limitTotal-t.limitLeft))} нельзя целиком называть списанием. Если сумма непонятна, уточните у диспетчера.</p></details></div>`+notice(!storageOK?'Не удалось безопасно прочитать или сохранить историю операций. Новый заказ заблокирован. Сохраните данные браузера и обратитесь за помощью.':'')+errors+btn('Заправиться','stations','primary',state.busy||!storageOK||!navigator.onLine)+btn('Обновить лимит','refreshHome','secondary',state.busy);
+      html=header('Заправка в рейсе')+`<div class="card"><div class="eyebrow">Текущий рейс · ${esc(new Date(t.date+'T12:00:00').toLocaleDateString('ru-RU',{day:'numeric',month:'long'}))}</div><div class="route">${esc(t.from)} → ${esc(t.to)}</div><p class="muted">Тягач ${esc(t.truck)}</p></div><div class="card"><div class="small">Сейчас доступно</div><div class="hero">${esc(num(t.limitLeft))} ₽</div><div class="small">Общий лимит рейса ${esc(money(t.limitTotal))}</div><div class="bar"><i style="width:${Math.min(100,Math.max(0,100*t.limitLeft/t.limitTotal))}%"></i></div><details><summary>Почему доступно меньше?</summary><p>Лимит уменьшают покупки и временные резервы. Резерв — деньги под заказ: их нельзя потратить повторно. После расчёта АЗС неиспользованная часть возвращается.</p><p>История покупок и старых резервов здесь недоступна. Разницу ${esc(money(t.limitTotal-t.limitLeft))} нельзя целиком называть списанием. Если сумма непонятна, уточните у диспетчера.</p></details></div>`+notice(!storageOK?'Не удалось безопасно прочитать или сохранить историю операций. Новый заказ заблокирован. Сохраните данные браузера и обратитесь за помощью.':'')+errors+btn('Заправиться','stations','primary',state.busy||!storageOK||!navigator.onLine)+btn('Обновить лимит','refreshHome','secondary',state.busy);
     }
     if(state.screen==='stations') {
       html=back('home')+header('Выберите АЗС','1 / 3 · Место')+'<p class="small">Выберите станцию, у которой стоите или к которой можете безопасно подъехать.</p>'+errors+
@@ -96,13 +97,13 @@
     if(state.screen==='pending') html=header('Проверяем заказ')+notice('Ответ не получен. Заказ мог быть принят и деньги могли попасть в резерв. Не создавайте второй заказ.')+errors+`<div class="card">${rows([['АЗС',journal.pending?.stationName||'Уточняем'],['Запрос',journal.pending?.request.clientRequestId||'Уточняем']])}</div><p>Повторная проверка использует тот же номер запроса и восстанавливает прежнюю операцию.</p>`+btn(state.busy?'Проверяем…':'Проверить тот же заказ','resolve','primary',state.busy||!navigator.onLine);
     if(state.screen==='active' && f) {
       const titles={accepted:'АЗС принимает заказ',waiting_nozzle:'Подготовьте пистолет',fueling:'Идёт заправка'};
-      html=header(titles[f.status]||'Уточняем статус')+errors+`<p>${esc(f.stationName)} · колонка ${esc(f.pump)}</p><p class="small">${esc(f.fuelName)} · ${esc(journal.purpose||'Бак не указан')}</p>`+notice(f.status==='fueling'?'Налив уже начался. Отмена в приложении недоступна. При проблеме используйте остановку на колонке и обратитесь к сотруднику АЗС.':'Вставьте нужный пистолет и следуйте указаниям АЗС. Не ждите таймера в приложении: точный срок API не сообщает.')+`<div class="card"><div class="small">Последние данные АЗС${state.stale?' · связь потеряна':''}</div><div class="hero">${esc(num(f.currentLiters))} л</div><p>Заказано ${esc(num(f.liters))} л</p><p class="small">Резерв ${esc(money(f.amountHeld))}</p></div><p class="small">При обрыве связи заправка на АЗС может продолжаться. Статус восстановится автоматически.</p>`+btn('Обновить статус','poll','secondary',state.busy||pollBusy)+(['accepted','waiting_nozzle'].includes(f.status)?btn('Отменить до налива','askCancel','danger',state.busy):'');
+      html=header(titles[f.status]||'Уточняем статус')+errors+`<p>${esc(f.stationName)} · колонка ${esc(f.pump)}</p><p class="small">${esc(f.fuelName)} · ${esc(journal.purpose||'Бак не указан')}</p>`+notice(f.status==='fueling'?'Налив уже начался. Отмена в приложении недоступна. При проблеме используйте остановку на колонке и обратитесь к сотруднику АЗС.':'Вставьте нужный пистолет и следуйте указаниям АЗС. Не ждите таймера в приложении: точное время ожидания неизвестно.')+`<div class="card"><div class="small">Последние данные АЗС${state.stale?' · связь потеряна':''}</div><div class="hero">${esc(num(f.currentLiters))} л</div><p>Заказано ${esc(num(f.liters))} л</p><p class="small">Резерв ${esc(money(f.amountHeld))}</p></div><p class="small">При обрыве связи заправка на АЗС может продолжаться. Статус восстановится автоматически.</p>`+btn('Обновить статус','poll','secondary',state.busy||pollBusy)+(['accepted','waiting_nozzle'].includes(f.status)?btn('Отменить до налива','askCancel','danger',state.busy):'');
     }
     if(state.screen==='cancelConfirm' && f) html=header('Отменить заказ?')+'<p>Отмена возможна, пока налив не начался. Окончательный ответ даст АЗС. Во время ожидания налив может начаться.</p>'+errors+btn('Да, запросить отмену','cancel','danger',state.busy)+btn('Продолжить заправку','keep','secondary',state.busy);
     if(state.screen==='result' && f) {
       const complete=f.status==='completed';
       const reasons={DRIVER_CANCELLED:'Заказ отменён по вашему запросу.',PUMP_TIMEOUT:'АЗС не дождалась начала заправки.',STATION_NO_RESPONSE:'АЗС не подтвердила заказ.'};
-      html=`<div class="status-icon">${complete?'✓':'—'}</div>`+header(complete?'Заправка завершена':'Заправка отменена')+errors+`<p class="small">${esc(f.stationName)} · колонка ${esc(f.pump)} · ${esc(f.fuelName)}</p>`+notice(complete&&f.factLiters<f.liters?`Залито меньше заказа: ${num(f.factLiters)} из ${num(f.liters)} л. Спишется только факт.`:complete?'Итог подтверждён АЗС.':reasons[f.reason]||'Заказ закрыт АЗС.',complete?'success':'')+`<div class="card">`+rows([['Залито',num(complete?f.factLiters:0)+' л'],['Списано',money(complete?f.factAmount:0)],['Было в резерве',money(f.amountHeld)],['Освобождено из резерва',money(round(f.amountHeld-(f.factAmount||0)))],['Доступно сейчас',state.stale?'Не удалось обновить':money(state.trip.limitLeft)]])+`</div><p class="small">Возврат из резерва подтверждён учебным API. Другие старые резервы могут оставаться. Чек в этом прототипе недоступен — запросите у диспетчера, отправка не подтверждена.</p><details><summary>Номер для обращения</summary><p>${esc(f.id)}</p></details>`+btn('На главную','finishHome','primary',state.busy)+btn('Обновить доступный лимит','resultRefresh','secondary',state.busy);
+      html=`<div class="status-icon">${complete?'✓':'—'}</div>`+header(complete?'Заправка завершена':'Заправка отменена')+errors+`<p class="small">${esc(f.stationName)} · колонка ${esc(f.pump)} · ${esc(f.fuelName)}</p>`+notice(complete&&f.factLiters<f.liters?`Залито меньше заказа: ${num(f.factLiters)} из ${num(f.liters)} л. Спишется только факт.`:complete?'Итог подтверждён АЗС.':reasons[f.reason]||'Заказ закрыт АЗС.',complete?'success':'')+`<div class="card">`+rows([['Залито',num(complete?f.factLiters:0)+' л'],['Списано',money(complete?f.factAmount:0)],['Было в резерве',money(f.amountHeld)],['Освобождено из резерва',money(round(f.amountHeld-(f.factAmount||0)))],['Доступно сейчас',state.stale?'Не удалось обновить':money(state.trip.limitLeft)]])+`</div><p class="small">Резерв этого заказа освобождён. Другие старые резервы могут оставаться. Чек в этом прототипе недоступен — запросите у диспетчера, отправка не подтверждена.</p><details><summary>Номер для обращения</summary><p>${esc(f.id)}</p></details>`+btn('На главную','finishHome','primary',state.busy)+btn('Обновить доступный лимит','resultRefresh','secondary',state.busy);
     }
     root.innerHTML=html;
     if(state.screen==='form') updateAmount();
@@ -140,7 +141,7 @@
     setScreen('stations');
   }
   async function chooseStation(id) {
-    state.station=await api.getStation(id);state.pump=null;state.liters='50';
+    state.station=await api.getStation(id);state.pump=null;state.liters='';
     state.fuel=state.station.fuels.some(x=>x.code==='diesel')?'diesel':state.station.fuels[0].code;
     setScreen('form');
   }
@@ -157,6 +158,7 @@
     state.screen=terminal(f)?'result':confirming?'cancelConfirm':'active';state.stale=false;failures=0;
     if(terminal(f)){try{state.trip=await api.getTrip();}catch(_){state.stale=true;}}
     else schedulePoll();
+    render();
   }
   function schedulePoll(){clearTimeout(timer);timer=setTimeout(()=>poll(),Math.min(12000,1800*2**failures));}
   async function poll(){
@@ -200,7 +202,7 @@
   }
   async function start(){
     if(!state.confirmed)return;
-    if(!navigator.locks){state.error='Для защиты заказа в нескольких вкладках нужен современный Chrome или Edge с Web Locks. Откройте прототип в таком браузере.';return;}
+    if(!navigator.locks){state.error='Защита от повторного заказа в этом браузере недоступна. Откройте прототип в актуальном Chrome или Edge через локальный адрес.';return;}
     await navigator.locks.request('cargotech.fueling.order.v1',{ifAvailable:true},async lock=>{
       if(!lock){state.error='Заказ проверяется в другой вкладке. Дождитесь результата и обновите данные.';return;}
       loadJournal();
@@ -252,8 +254,14 @@
     if(el.id==='confirm'){state.confirmed=el.checked;render();}
   });
   window.addEventListener('offline',()=>render());
-  window.addEventListener('storage',e=>{if(e.key===KEY&&!state.busy&&!resolving)boot();});
+  window.addEventListener('storage',e=>{if(sessionOwned&&e.key===KEY&&!state.busy&&!resolving)boot();});
   window.addEventListener('online',()=>{render();if(state.screen==='pending')work(resolvePending);else if(state.fueling&&!terminal(state.fueling))poll();});
   document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.fueling&&!terminal(state.fueling))poll();});
-  boot();
+  // The supplied fake API caches its state per tab. Keep exactly one live tab, even for reads/replays.
+  if(navigator.locks) navigator.locks.request('cargotech.driver.session.v1',{ifAvailable:true},async lock=>{
+    if(!lock){state.screen='otherTab';render();return;}
+    sessionOwned=true;
+    await boot();await new Promise(()=>{}); // Browser releases the lock when the tab closes/reloads.
+  });
+  else boot();
 })();
