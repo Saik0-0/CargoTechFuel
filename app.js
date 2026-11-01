@@ -12,7 +12,7 @@
   const round = v => Math.round((v + Number.EPSILON) * 100) / 100;
   const cents = v => Math.round(v * 100);
   const state = {screen:'loading', trip:null, stations:[], station:null, location:null, fuel:'diesel', pump:null, liters:'50', purpose:'Тягач', fueling:null, busy:false, error:'', stale:false, geoError:false, all:false, sort:'distance', search:'', confirmed:false};
-  let journal = {}, storageOK = true, timer = null, pollBusy = false, failures = 0;
+  let journal = {}, storageOK = true, timer = null, pollBusy = false, resolving = false, failures = 0;
   function readJournal() {
     const raw = localStorage.getItem(KEY);
     if (!raw) return {};
@@ -149,19 +149,82 @@
     const p=state.station.pumps.find(x=>x.number===state.pump);
     if(!p||p.status!=='free'||!p.fuels.includes(state.fuel))state.pump=null;
   }
-  // Added below: durable start/recovery and polling. All monetary mutations pass through the journal.
+  // Persist the immutable POST before sending it. Never generate a new key for an ambiguous result.
   async function acceptFueling(f) {
     state.fueling=f;
     saveJournal({activeId:f.id,purpose:journal.pending?.purpose||journal.purpose||state.purpose});
-    state.screen=terminal(f)?'result':'active';state.stale=false;failures=0;
+    const confirming=state.screen==='cancelConfirm'&&!terminal(f)&&f.status!=='fueling';
+    state.screen=terminal(f)?'result':confirming?'cancelConfirm':'active';state.stale=false;failures=0;
     if(terminal(f)){try{state.trip=await api.getTrip();}catch(_){state.stale=true;}}
     else schedulePoll();
   }
-  function schedulePoll(){clearTimeout(timer);timer=setTimeout(()=>poll(),1800);}
-  async function poll(){if(!state.fueling||terminal(state.fueling)||pollBusy)return;pollBusy=true;try{await acceptFueling(await api.getFueling(state.fueling.id));}catch(e){state.stale=true;state.error=errorText(e);schedulePoll();}finally{pollBusy=false;render();}}
-  async function resolvePending(){throw new Error('Восстановление запроса ещё не подключено');}
-  async function start(){throw new Error('Запуск заказа ещё не подключён');}
-  async function cancel(){await acceptFueling(await api.cancelFueling(state.fueling.id));}
+  function schedulePoll(){clearTimeout(timer);timer=setTimeout(()=>poll(),Math.min(12000,1800*2**failures));}
+  async function poll(){
+    if(!state.fueling||terminal(state.fueling)||pollBusy)return;
+    pollBusy=true;
+    try{await acceptFueling(await api.getFueling(state.fueling.id));state.error='';}
+    catch(e){failures++;state.stale=true;state.error=errorText(e);schedulePoll();}
+    finally{pollBusy=false;render();}
+  }
+  const rejected = new Set(['INVALID_REQUEST','STATION_NOT_FOUND','PUMP_BUSY','FUEL_NOT_AVAILABLE','INVALID_LITERS','PRICE_CHANGED','LIMIT_EXCEEDED']);
+  async function resolvePending(){
+    if(resolving||!journal.pending)return;
+    resolving=true;clearTimeout(timer);
+    const pending=journal.pending;
+    state.screen='pending';render();
+    try{
+      const f=await api.startFueling(pending.request);
+      await acceptFueling(f);state.error='';
+    }catch(e){
+      if(!rejected.has(e.code)){
+        state.screen='pending';state.stale=true;state.error='Не удалось подтвердить результат. Сохраняем прежний заказ и проверим его снова.';
+        failures++;timer=setTimeout(()=>work(resolvePending),Math.min(12000,1800*2**failures));
+      }else{
+        // These API branches occur before creation. A transport error never enters this branch.
+        if(!saveJournal({})){state.error='Не удалось сохранить подтверждённый отказ. Восстановление будет повторено с прежним номером.';return;}
+        state.screen=state.station?'form':'home';state.stale=false;state.confirmed=false;
+        if(e.code==='PRICE_CHANGED'){
+          if(state.station){
+            state.station.prices[pending.request.fuel]=e.details.newPrice;
+            const fuel=state.station.fuels.find(x=>x.code===pending.request.fuel);if(fuel)fuel.price=e.details.newPrice;
+          }
+          state.error=`Цена изменилась с ${money(e.details.oldPrice)} до ${money(e.details.newPrice)} за литр. Заказ не создан. Проверьте новую сумму и подтвердите заново.`;
+        }else if(e.code==='PUMP_BUSY'){
+          if(state.station){const p=state.station.pumps.find(x=>x.number===state.pump);if(p)p.status='busy';state.pump=null;}
+          state.error='Колонка занята. Заказ не создан. Не выбирайте соседнюю: дождитесь освобождения своей или переезжайте и проверьте номер.';
+        }else if(e.code==='LIMIT_EXCEEDED'){
+          state.trip.limitLeft=e.details.available;state.error=`Не хватает лимита. Сейчас доступно ${money(e.details.available)}. Заказ не создан, уменьшите объём.`;
+        }else state.error=errorText(e)+' Заказ не создан. Обновите данные АЗС.';
+      }
+    }finally{resolving=false;render();}
+  }
+  async function start(){
+    if(!state.confirmed)return;
+    if(!navigator.locks){state.error='Для защиты заказа в нескольких вкладках нужен современный Chrome или Edge с Web Locks. Откройте прототип в таком браузере.';return;}
+    await navigator.locks.request('cargotech.fueling.order.v1',{ifAvailable:true},async lock=>{
+      if(!lock){state.error='Заказ проверяется в другой вкладке. Дождитесь результата и обновите данные.';return;}
+      loadJournal();
+      if(!storageOK){state.error='История операций недоступна. Новый заказ заблокирован.';return;}
+      if(journal.pending){await resolvePending();return;}
+      if(journal.activeId){await acceptFueling(await api.getFueling(journal.activeId));return;}
+      const active=await api.getActiveFueling();
+      if(active){await acceptFueling(active);return;}
+      state.trip=await api.getTrip();const error=validation();
+      if(error){state.screen='form';state.error=error;return;}
+      const request={stationId:state.station.id,pump:state.pump,fuel:state.fuel,liters:Number(String(state.liters).replace(',','.')),price:state.station.prices[state.fuel],clientRequestId:crypto.randomUUID()};
+      if(!saveJournal({pending:{request,purpose:state.purpose,stationName:state.station.name}})){
+        state.error='Не удалось сохранить номер запроса. Заказ не отправлен.';return;
+      }
+      await resolvePending();
+    });
+  }
+  async function cancel(){
+    try{await acceptFueling(await api.cancelFueling(state.fueling.id));state.error='';}
+    catch(e){
+      state.screen='active';state.error=e.code==='CANNOT_CANCEL'?'АЗС отклонила отмену: налив начался или заказ уже завершён. Обновляем статус.':'Отмена не подтверждена. Не считайте заказ отменённым до ответа АЗС.';
+      await poll();
+    }
+  }
   const actions={
     boot:()=>boot(),home:()=>setScreen('home'),stations:()=>showStations(),stationsBack:()=>setScreen('stations'),formBack:()=>setScreen('form'),
     refreshHome:async()=>{state.trip=await api.getTrip();},refreshStation,
@@ -189,6 +252,7 @@
     if(el.id==='confirm'){state.confirmed=el.checked;render();}
   });
   window.addEventListener('offline',()=>render());
+  window.addEventListener('storage',e=>{if(e.key===KEY&&!state.busy&&!resolving)boot();});
   window.addEventListener('online',()=>{render();if(state.screen==='pending')work(resolvePending);else if(state.fueling&&!terminal(state.fueling))poll();});
   document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.fueling&&!terminal(state.fueling))poll();});
   boot();
